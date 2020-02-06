@@ -26,6 +26,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.net.util.SubnetUtils;
 import org.apache.http.HttpException;
 import org.apache.http.HttpRequest;
 import org.apache.http.HttpResponse;
@@ -137,6 +138,7 @@ import static org.apache.commons.io.IOUtils.toInputStream;
 import static org.onlab.packet.Ip4Address.valueOf;
 import static org.onosproject.net.AnnotationKeys.PORT_NAME;
 import static org.onosproject.openstacknetworking.api.Constants.DEFAULT_GATEWAY_MAC_STR;
+import static org.onosproject.openstacknetworking.api.Constants.DIRECT;
 import static org.onosproject.openstacknetworking.api.Constants.FLOATING_IP_FORMAT;
 import static org.onosproject.openstacknetworking.api.Constants.NETWORK_FORMAT;
 import static org.onosproject.openstacknetworking.api.Constants.OPENSTACK_NETWORKING_REST_PATH;
@@ -396,6 +398,24 @@ public final class OpenstackNetworkingUtil {
             log.error("Authentication failed due to {}", e);
             return null;
         }
+    }
+
+    /**
+     * Checks whether the given openstack port is smart NIC capable.
+     *
+     * @param port openstack port
+     * @return true if the given port is smart NIC capable, false otherwise
+     */
+    public static boolean isSmartNicCapable(Port port) {
+        if (port.getProfile() != null && port.getvNicType().equals(DIRECT)) {
+            String vendorInfo = String.valueOf(port.getProfile().get(PCI_VENDOR_INFO));
+            if (portNamePrefixMap().containsKey(vendorInfo)) {
+                log.debug("Port {} is a Smart NIC capable port.", port.getId());
+                return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     /**
@@ -662,8 +682,6 @@ public final class OpenstackNetworkingUtil {
             log.debug("JsonMappingException caused by {}", e);
         } catch (JsonProcessingException e) {
             log.debug("JsonProcessingException caused by {}", e);
-        } catch (IOException e) {
-            log.debug("IOException caused by {}", e);
         }
         return null;
     }
@@ -1464,6 +1482,19 @@ public final class OpenstackNetworkingUtil {
      */
     public static GroupKey getGroupKey(int groupId) {
         return new DefaultGroupKey((Integer.toString(groupId)).getBytes());
+    }
+
+    /**
+     * Calculate the broadcast address from given IP address and subnet prefix length.
+     *
+     * @param ipAddr        IP address
+     * @param prefixLength  subnet prefix length
+     * @return broadcast address
+     */
+    public static String getBroadcastAddr(String ipAddr, int prefixLength) {
+        String subnet = ipAddr + "/" + prefixLength;
+        SubnetUtils utils = new SubnetUtils(subnet);
+        return utils.getInfo().getBroadcastAddress();
     }
 
     /**

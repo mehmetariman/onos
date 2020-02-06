@@ -177,6 +177,12 @@ class OFChannelHandler extends ChannelInboundHandlerAdapter
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     private OpenFlowService openFlowManager;
 
+    // Each IDLE_INTERVAL (see OFChannelInitializer) we will perform a sanity check
+    // Idle timeout actions will be performed each MAX_IDLE_RETRY * IDLE_INTERVAL
+    private static final int MAX_IDLE_RETRY = 4;
+    private int maxIdleRetry = MAX_IDLE_RETRY;
+
+    // Dispatcher buffer/read size
     private static final int BACKLOG_READ_BUFFER_DEFAULT = 1000;
 
     /**
@@ -1431,31 +1437,47 @@ class OFChannelHandler extends ChannelInboundHandlerAdapter
         return getSwitchInfoString();
     }
 
+    // We have reduced the idle period, the idea is to use
+    // the IdleHandler to perform also some sanity checks.
+    // Previous code is still executed with the same frequency
+    // which is IDLE_INTERVAL * MAX_IDLE_RETRY of inactivity
     private void channelIdle(ChannelHandlerContext ctx,
                                IdleStateEvent e)
             throws IOException {
-        // Factory can be null if the channel goes idle during initial handshake. Since the switch
-        // is not even initialized properly, we just skip this and disconnect the channel.
-        if (factory != null) {
-            OFMessage m = factory.buildEchoRequest().build();
-            log.debug("Sending Echo Request on idle channel: {}", ctx.channel());
-            ctx.write(Collections.singletonList(m), ctx.voidPromise());
-            // XXX S some problems here -- echo request has no transaction id, and
-            // echo reply is not correlated to the echo request.
+        // dispatcher terminated for some reason, restart
+        if (dispatcherHandle.isDone()) {
+            dispatcherHandle = dispatcher.submit(new Dispatcher());
         }
-        state.processIdle(this);
+        // drain the backlog
+        processDispatchBacklogQueue();
+        // Original timeout reached
+        if (--maxIdleRetry == 0) {
+            maxIdleRetry = MAX_IDLE_RETRY;
+            // Factory can be null if the channel goes idle during initial handshake. Since the switch
+            // is not even initialized properly, we just skip this and disconnect the channel.
+            if (factory != null) {
+                // send an echo request each time idle_timeout * TICK
+                OFMessage m = factory.buildEchoRequest().build();
+                log.info("Sending Echo Request on idle channel: {}", ctx.channel());
+                // XXX S some problems here -- echo request has no transaction id, and
+                // echo reply is not correlated to the echo request.
+                ctx.writeAndFlush(Collections.singletonList(m), ctx.voidPromise());
+            }
+            state.processIdle(this);
+        }
     }
 
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx,
                                    Object evt)
             throws Exception {
-
+        // If the connection is READER/WRITER idle try to send an echo request
         if (evt instanceof IdleStateEvent) {
+            log.debug("Channel {} is {}", ctx.channel(), ((IdleStateEvent) evt).state());
             channelIdle(ctx, (IdleStateEvent) evt);
+        } else {
+            super.userEventTriggered(ctx, evt);
         }
-
-        super.userEventTriggered(ctx, evt);
     }
 
     // SimpleChannelInboundHandler without dependency to TypeParameterMatcher
@@ -1464,6 +1486,7 @@ class OFChannelHandler extends ChannelInboundHandlerAdapter
                             Object msg) throws Exception {
 
         boolean release = true;
+        maxIdleRetry = MAX_IDLE_RETRY;
         try {
             if (msg instanceof OFMessage) {
                 // channelRead0 inlined
@@ -1617,29 +1640,34 @@ class OFChannelHandler extends ChannelInboundHandlerAdapter
 
         if (dispatcherHandle.isDone()) {
             // dispatcher terminated for some reason, restart
-            dispatcherHandle = dispatcher.submit((Runnable) () -> {
-                try {
-                    for (;;) {
-                        int tc = 0;
-                        takeLock.lockInterruptibly();
-                        try {
-                            while ((tc = totalCount.get()) == 0) {
-                                notEmpty.await();
-                            }
-                        } finally {
-                            takeLock.unlock();
+            dispatcherHandle = dispatcher.submit(new Dispatcher());
+        }
+    }
+
+    private final class Dispatcher implements Runnable {
+        // dispatch loop
+        @Override
+        public void run() {
+            try {
+                for (;;) {
+                    int tc = 0;
+                    takeLock.lockInterruptibly();
+                    try {
+                        while ((tc = totalCount.get()) == 0) {
+                            notEmpty.await();
                         }
-
-                        processMessages(tc);
+                    } finally {
+                        takeLock.unlock();
                     }
-                } catch (InterruptedException e) {
-                    log.warn("Dispatcher interrupted");
-                    Thread.currentThread().interrupt();
-                    // interrupted. gracefully shutting down
-                    return;
-                }
 
-            });
+                    processMessages(tc);
+                }
+            } catch (InterruptedException e) {
+                log.warn("Dispatcher interrupted");
+                Thread.currentThread().interrupt();
+                // interrupted. gracefully shutting down
+                return;
+            }
         }
     }
 

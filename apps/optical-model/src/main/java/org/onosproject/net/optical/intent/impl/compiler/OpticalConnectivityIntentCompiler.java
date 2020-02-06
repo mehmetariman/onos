@@ -182,6 +182,7 @@ public class OpticalConnectivityIntentCompiler implements IntentCompiler<Optical
         return OpticalPathIntent.builder()
                 .appId(parentIntent.appId())
                 .key(parentIntent.key())
+                .priority(parentIntent.priority())
                 .src(parentIntent.getSrc())
                 .dst(parentIntent.getDst())
                 .path(path)
@@ -394,7 +395,8 @@ public class OpticalConnectivityIntentCompiler implements IntentCompiler<Optical
                 }
 
                 Annotations annotations = edge.link().annotations();
-                if (annotations != null && !annotations.value("metric").isEmpty()) {
+                if (annotations != null &&
+                        annotations.value("metric") != null && !annotations.value("metric").isEmpty()) {
                     double metric = Double.parseDouble(annotations.value("metric"));
                     return ScalarWeight.toWeight(metric);
                 } else {

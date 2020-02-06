@@ -63,10 +63,10 @@ control Acl (inout parsed_headers_t hdr,
             fabric_metadata.ip_proto: ternary @name("ip_proto"); // 8
             fabric_metadata.l4_sport: ternary @name("l4_sport"); // 16
             fabric_metadata.l4_dport: ternary @name("l4_dport"); // 16
-            hdr.ethernet.dst_addr: ternary @name("eth_src"); // 48
-            hdr.ethernet.src_addr: ternary @name("eth_dst"); // 48
+            hdr.ethernet.dst_addr: ternary @name("eth_dst"); // 48
+            hdr.ethernet.src_addr: ternary @name("eth_src"); // 48
             hdr.vlan_tag.vlan_id: ternary @name("vlan_id"); // 12
-            fabric_metadata.last_eth_type: ternary @name("eth_type"); //16
+            hdr.eth_type.value: ternary @name("eth_type"); //16
             hdr.ipv4.src_addr: ternary @name("ipv4_src"); // 32
             hdr.ipv4.dst_addr: ternary @name("ipv4_dst"); // 32
             hdr.icmp.icmp_type: ternary @name("icmp_type"); // 8
