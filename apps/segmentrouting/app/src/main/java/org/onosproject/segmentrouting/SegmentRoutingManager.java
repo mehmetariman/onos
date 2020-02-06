@@ -642,6 +642,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
         policyStore.destroy();
 
         mcastHandler.terminate();
+        hostHandler.terminate();
         log.info("Stopped");
     }
 
@@ -1291,6 +1292,14 @@ public class SegmentRoutingManager implements SegmentRoutingService {
      */
     public void updateMacVlanTreatment(DeviceId deviceId, MacAddress hostMac,
                              VlanId hostVlanId, PortNumber port, int nextId) {
+        // Check if we are the king of this device
+        // just one instance should perform this update
+        if (!defaultRoutingHandler.shouldProgram(deviceId)) {
+            log.debug("This instance is not handling the routing towards the "
+                              + "device {}", deviceId);
+            return;
+        }
+        // Get the handler and perform the update
         DefaultGroupHandler ghdlr = groupHandlerMap.get(deviceId);
         if (ghdlr != null) {
             ghdlr.updateL3UcastGroupBucket(hostMac, hostVlanId, port, nextId);
@@ -1446,6 +1455,10 @@ public class SegmentRoutingManager implements SegmentRoutingService {
                 } else if (event.type() == HostEvent.Type.HOST_MOVED) {
                     hostHandler.processHostMovedEvent((HostEvent) event);
                     routeHandler.processHostMovedEvent((HostEvent) event);
+                } else if (event.type() == HostEvent.Type.HOST_AUX_MOVED) {
+                    hostHandler.processHostMovedEvent((HostEvent) event);
+                    // TODO RouteHandler also needs to process this event in order to
+                    //      support nexthops that has auxLocations
                 } else if (event.type() == HostEvent.Type.HOST_REMOVED) {
                     hostHandler.processHostRemovedEvent((HostEvent) event);
                 } else if (event.type() == HostEvent.Type.HOST_UPDATED) {

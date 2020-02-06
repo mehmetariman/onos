@@ -21,6 +21,7 @@ import org.onlab.packet.IpAddress;
 import org.onlab.packet.IpPrefix;
 import org.onlab.packet.MacAddress;
 import org.onlab.packet.VlanId;
+import org.onlab.util.PredictableExecutor;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.Host;
@@ -40,6 +41,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static org.onlab.util.Tools.groupedThreads;
 
 /**
  * Handles host-related events.
@@ -49,6 +51,9 @@ public class HostHandler {
 
     protected final SegmentRoutingManager srManager;
     private HostService hostService;
+    // Host workers - 0 will leverage available processors
+    private static final int DEFAULT_THREADS = 0;
+    protected PredictableExecutor hostWorkers;
 
     /**
      * Constructs the HostHandler.
@@ -58,26 +63,43 @@ public class HostHandler {
     HostHandler(SegmentRoutingManager srManager) {
         this.srManager = srManager;
         hostService = srManager.hostService;
+        this.hostWorkers = new PredictableExecutor(DEFAULT_THREADS,
+                                                   groupedThreads("onos/sr", "h-worker-%d", log));
+    }
+
+    /**
+     * Shutdowns the workers.
+     */
+    void terminate() {
+        hostWorkers.shutdown();
     }
 
     protected void init(DeviceId devId) {
-        hostService.getHosts().forEach(host ->
-            host.locations().stream()
-                    .filter(location -> location.deviceId().equals(devId) ||
-                            location.deviceId().equals(srManager.getPairDeviceId(devId).orElse(null)))
-                    .forEach(location -> processHostAddedAtLocation(host, location))
+        // Init hosts in parallel using hostWorkers executor
+        hostService.getHosts().forEach(
+                host -> hostWorkers.execute(() -> initHost(host, devId), host.id().hashCode())
         );
     }
 
+    private void initHost(Host host, DeviceId deviceId) {
+        effectiveLocations(host).forEach(location -> {
+            if (location.deviceId().equals(deviceId) ||
+                    location.deviceId().equals(srManager.getPairDeviceId(deviceId).orElse(null))) {
+                processHostAddedAtLocation(host, location);
+            }
+        });
+    }
+
     void processHostAddedEvent(HostEvent event) {
-        processHostAdded(event.subject());
+        Host host = event.subject();
+        hostWorkers.execute(() -> processHostAdded(host), host.id().hashCode());
     }
 
     private void processHostAdded(Host host) {
-        host.locations().forEach(location -> processHostAddedAtLocation(host, location));
+        effectiveLocations(host).forEach(location -> processHostAddedAtLocation(host, location));
         // ensure dual-homed host locations have viable uplinks
-        if (host.locations().size() > 1 || srManager.singleHomedDown) {
-            host.locations().forEach(loc -> {
+        if (effectiveLocations(host).size() > 1 || srManager.singleHomedDown) {
+            effectiveLocations(host).forEach(loc -> {
                 if (srManager.mastershipService.isLocalMaster(loc.deviceId())) {
                     srManager.linkHandler.checkUplinksForHost(loc);
                 }
@@ -86,11 +108,11 @@ public class HostHandler {
     }
 
     void processHostAddedAtLocation(Host host, HostLocation location) {
-        checkArgument(host.locations().contains(location), "{} is not a location of {}", location, host);
+        checkArgument(effectiveLocations(host).contains(location), "{} is not a location of {}", location, host);
 
         MacAddress hostMac = host.mac();
         VlanId hostVlanId = host.vlan();
-        Set<HostLocation> locations = host.locations();
+        Set<HostLocation> locations = effectiveLocations(host);
         Set<IpAddress> ips = host.ipAddresses();
         log.info("Host {}/{} is added at {}", hostMac, hostVlanId, locations);
 
@@ -110,7 +132,7 @@ public class HostHandler {
         // This do not affect single-homed hosts since the flow will be blocked in
         // processBridgingRule or processRoutingRule due to VLAN or IP mismatch respectively
         srManager.getPairDeviceId(location.deviceId()).ifPresent(pairDeviceId -> {
-            if (host.locations().stream().noneMatch(l -> l.deviceId().equals(pairDeviceId))) {
+            if (effectiveLocations(host).stream().noneMatch(l -> l.deviceId().equals(pairDeviceId))) {
                 srManager.getPairLocalPort(pairDeviceId).ifPresent(pairRemotePort -> {
                     // NOTE: Since the pairLocalPort is trunk port, use assigned vlan of original port
                     //       when the host is untagged
@@ -141,13 +163,14 @@ public class HostHandler {
     }
 
     void processHostRemovedEvent(HostEvent event) {
-        processHostRemoved(event.subject());
+        Host host = event.subject();
+        hostWorkers.execute(() -> processHostRemoved(host), host.id().hashCode());
     }
 
     private void processHostRemoved(Host host) {
         MacAddress hostMac = host.mac();
         VlanId hostVlanId = host.vlan();
-        Set<HostLocation> locations = host.locations();
+        Set<HostLocation> locations = effectiveLocations(host);
         Set<IpAddress> ips = host.ipAddresses();
         log.info("Host {}/{} is removed from {}", hostMac, hostVlanId, locations);
 
@@ -196,11 +219,26 @@ public class HostHandler {
 
     void processHostMovedEvent(HostEvent event) {
         Host host = event.subject();
+        hostWorkers.execute(() -> processHostMovedEventInternal(event), host.id().hashCode());
+    }
+
+    private void processHostMovedEventInternal(HostEvent event) {
+        // This method will be called when one of the following value has changed:
+        // (1) locations (2) auxLocations or (3) both locations and auxLocations.
+        // We only need to proceed when effectiveLocation has changed.
+        Set<HostLocation> newLocations = effectiveLocations(event.subject());
+        Set<HostLocation> prevLocations = effectiveLocations(event.prevSubject());
+
+        if (newLocations.equals(prevLocations)) {
+            log.info("effectiveLocations of {} has not changed. Skipping {}", event.subject().id(), event);
+            return;
+        }
+
+        Host host = event.subject();
+        Host prevHost = event.prevSubject();
         MacAddress hostMac = host.mac();
         VlanId hostVlanId = host.vlan();
-        Set<HostLocation> prevLocations = event.prevSubject().locations();
-        Set<IpAddress> prevIps = event.prevSubject().ipAddresses();
-        Set<HostLocation> newLocations = host.locations();
+        Set<IpAddress> prevIps = prevHost.ipAddresses();
         Set<IpAddress> newIps = host.ipAddresses();
         EthType hostTpid = host.tpid();
         boolean doubleTaggedHost = isDoubleTaggedHost(host);
@@ -349,10 +387,15 @@ public class HostHandler {
 
     void processHostUpdatedEvent(HostEvent event) {
         Host host = event.subject();
+        hostWorkers.execute(() -> processHostUpdatedEventInternal(event), host.id().hashCode());
+    }
+
+    private void processHostUpdatedEventInternal(HostEvent event) {
+        Host host = event.subject();
         MacAddress hostMac = host.mac();
         VlanId hostVlanId = host.vlan();
         EthType hostTpid = host.tpid();
-        Set<HostLocation> locations = host.locations();
+        Set<HostLocation> locations = effectiveLocations(host);
         Set<IpAddress> prevIps = event.prevSubject().ipAddresses();
         Set<IpAddress> newIps = host.ipAddresses();
         log.info("Host {}/{} is updated", hostMac, hostVlanId);
@@ -418,16 +461,23 @@ public class HostHandler {
      *
      * @param cp connect point
      */
+    // TODO Current implementation does not handle dual-homed hosts with auxiliary locations.
     void processPortUp(ConnectPoint cp) {
         if (cp.port().equals(srManager.getPairLocalPort(cp.deviceId()).orElse(null))) {
             return;
         }
         if (srManager.activeProbing) {
             srManager.getPairDeviceId(cp.deviceId())
-                    .ifPresent(pairDeviceId -> srManager.hostService.getConnectedHosts(pairDeviceId).stream()
-                            .filter(host -> isHostInVlanOfPort(host, pairDeviceId, cp))
-                            .forEach(host -> srManager.probingService.probeHost(host, cp, ProbeMode.DISCOVER))
-                    );
+                    .ifPresent(pairDeviceId -> srManager.hostService.getConnectedHosts(pairDeviceId).forEach(
+                            host -> hostWorkers.execute(() -> probingIfNecessary(host, pairDeviceId, cp),
+                                                        host.id().hashCode())));
+        }
+    }
+
+    // TODO Current implementation does not handle dual-homed hosts with auxiliary locations.
+    private void probingIfNecessary(Host host, DeviceId pairDeviceId, ConnectPoint cp) {
+        if (isHostInVlanOfPort(host, pairDeviceId, cp)) {
+            srManager.probingService.probeHost(host, cp, ProbeMode.DISCOVER);
         }
     }
 
@@ -444,7 +494,7 @@ public class HostHandler {
         Set<VlanId> taggedVlan = srManager.interfaceService.getTaggedVlanId(cp);
 
         return taggedVlan.contains(host.vlan()) ||
-                (internalVlan != null && host.locations().stream()
+                (internalVlan != null && effectiveLocations(host).stream()
                         .filter(l -> l.deviceId().equals(deviceId))
                         .map(srManager::getInternalVlanId)
                         .anyMatch(internalVlan::equals));
@@ -458,6 +508,7 @@ public class HostHandler {
      * @param pairDeviceId pair device id
      * @param pairRemotePort pair remote port
      */
+    // TODO Current implementation does not handle dual-homed hosts with auxiliary locations.
     private void probe(Host host, ConnectPoint location, DeviceId pairDeviceId, PortNumber pairRemotePort) {
         //Check if the host still exists in the host store
         if (hostService.getHost(host.id()) == null) {
@@ -583,7 +634,7 @@ public class HostHandler {
     void populateAllDoubleTaggedHost() {
         log.info("Enabling routing for all double tagged hosts");
         Sets.newHashSet(srManager.hostService.getHosts()).stream().filter(this::isDoubleTaggedHost)
-                .forEach(h -> h.locations().forEach(l ->
+                .forEach(h -> effectiveLocations(h).forEach(l ->
                     h.ipAddresses().forEach(i ->
                         processDoubleTaggedRoutingRule(l.deviceId(), l.port(), h.mac(), h.innerVlan(),
                                 h.vlan(), h.tpid(), i, false)
@@ -595,7 +646,7 @@ public class HostHandler {
     void revokeAllDoubleTaggedHost() {
         log.info("Disabling routing for all double tagged hosts");
         Sets.newHashSet(srManager.hostService.getHosts()).stream().filter(this::isDoubleTaggedHost)
-                .forEach(h -> h.locations().forEach(l ->
+                .forEach(h -> effectiveLocations(h).forEach(l ->
                     h.ipAddresses().forEach(i ->
                         processDoubleTaggedRoutingRule(l.deviceId(), l.port(), h.mac(), h.innerVlan(),
                             h.vlan(), h.tpid(), i, true)
@@ -636,8 +687,9 @@ public class HostHandler {
      * @param popVlan true to pop Vlan tag at TrafficTreatment, false otherwise
      * @param install true to populate the objective, false to revoke
      */
+    // TODO Current implementation does not handle dual-homed hosts with auxiliary locations.
     void processIntfVlanUpdatedEvent(DeviceId deviceId, PortNumber portNum, VlanId vlanId,
-                                 boolean popVlan, boolean install) {
+                                     boolean popVlan, boolean install) {
         ConnectPoint connectPoint = new ConnectPoint(deviceId, portNum);
         Set<Host> hosts = hostService.getConnectedHosts(connectPoint);
 
@@ -646,22 +698,25 @@ public class HostHandler {
             return;
         }
 
-        hosts.forEach(host -> {
-            MacAddress mac = host.mac();
-            VlanId hostVlanId = host.vlan();
+        hosts.forEach(host -> hostWorkers.execute(() -> processIntfVlanUpdatedEventInternal(
+                host, deviceId, portNum, vlanId, popVlan, install), host.id().hashCode()));
+    }
 
-            // Check whether the host vlan is valid for new interface configuration
-            if ((!popVlan && hostVlanId.equals(vlanId)) ||
-                    (popVlan && hostVlanId.equals(VlanId.NONE))) {
-                srManager.defaultRoutingHandler.updateBridging(deviceId, portNum, mac, vlanId, popVlan, install);
-                // Update Forwarding objective and corresponding simple Next objective
-                // for each host and IP address connected to given port
-                host.ipAddresses().forEach(ipAddress ->
-                    srManager.defaultRoutingHandler.updateFwdObj(deviceId, portNum, ipAddress.toIpPrefix(),
-                                                                mac, vlanId, popVlan, install)
-                );
-            }
-        });
+    private void processIntfVlanUpdatedEventInternal(Host host, DeviceId deviceId, PortNumber portNum,
+                                                     VlanId vlanId, boolean popVlan, boolean install) {
+        MacAddress mac = host.mac();
+        VlanId hostVlanId = host.vlan();
+
+        // Check whether the host vlan is valid for new interface configuration
+        if ((!popVlan && hostVlanId.equals(vlanId)) ||
+                (popVlan && hostVlanId.equals(VlanId.NONE))) {
+            srManager.defaultRoutingHandler.updateBridging(deviceId, portNum, mac, vlanId, popVlan, install);
+            // Update Forwarding objective and corresponding simple Next objective
+            // for each host and IP address connected to given port
+            host.ipAddresses().forEach(ipAddress -> srManager.defaultRoutingHandler.updateFwdObj(
+                    deviceId, portNum, ipAddress.toIpPrefix(), mac, vlanId, popVlan, install)
+            );
+        }
     }
 
     /**
@@ -671,6 +726,7 @@ public class HostHandler {
      * @param ipPrefixSet IP Prefixes added or removed
      * @param install true if IP Prefixes added, false otherwise
      */
+    // TODO Current implementation does not handle dual-homed hosts with auxiliary locations.
     void processIntfIpUpdatedEvent(ConnectPoint cp, Set<IpPrefix> ipPrefixSet, boolean install) {
         Set<Host> hosts = hostService.getConnectedHosts(cp);
 
@@ -680,18 +736,23 @@ public class HostHandler {
         }
 
         // Check whether the host IP address is in the interface's subnet
-        hosts.forEach(host ->
-            host.ipAddresses().forEach(hostIpAddress -> {
-                ipPrefixSet.forEach(ipPrefix -> {
-                    if (install && ipPrefix.contains(hostIpAddress)) {
-                            srManager.defaultRoutingHandler.populateRoute(cp.deviceId(), hostIpAddress.toIpPrefix(),
-                                                                         host.mac(), host.vlan(), cp.port(), true);
-                    } else if (!install && ipPrefix.contains(hostIpAddress)) {
-                            srManager.defaultRoutingHandler.revokeRoute(cp.deviceId(), hostIpAddress.toIpPrefix(),
-                                                                       host.mac(), host.vlan(), cp.port(), true);
-                    }
-                });
-            }));
+        hosts.forEach(host -> hostWorkers.execute(() -> processIntfIpUpdatedEventInternal(
+                host, cp, ipPrefixSet, install)));
+    }
+
+    private void processIntfIpUpdatedEventInternal(Host host, ConnectPoint cp, Set<IpPrefix> ipPrefixSet,
+                                                   boolean install) {
+        host.ipAddresses().forEach(hostIpAddress -> {
+            ipPrefixSet.forEach(ipPrefix -> {
+                if (install && ipPrefix.contains(hostIpAddress)) {
+                    srManager.defaultRoutingHandler.populateRoute(cp.deviceId(), hostIpAddress.toIpPrefix(),
+                                                                  host.mac(), host.vlan(), cp.port(), true);
+                } else if (!install && ipPrefix.contains(hostIpAddress)) {
+                    srManager.defaultRoutingHandler.revokeRoute(cp.deviceId(), hostIpAddress.toIpPrefix(),
+                                                                host.mac(), host.vlan(), cp.port(), true);
+                }
+            });
+        });
     }
 
     /**
@@ -706,8 +767,8 @@ public class HostHandler {
     Set<PortNumber> getDualHomedHostPorts(DeviceId deviceId) {
         Set<PortNumber> dualHomedLocations = new HashSet<>();
         srManager.hostService.getConnectedHosts(deviceId).stream()
-            .filter(host -> host.locations().size() == 2)
-            .forEach(host -> host.locations().stream()
+            .filter(host -> effectiveLocations(host).size() == 2)
+            .forEach(host -> effectiveLocations(host).stream()
                      .filter(loc -> loc.deviceId().equals(deviceId))
                         .forEach(loc -> dualHomedLocations.add(loc.port())));
         return dualHomedLocations;
@@ -721,6 +782,16 @@ public class HostHandler {
      */
     private boolean isDoubleTaggedHost(Host host) {
         return !host.innerVlan().equals(VlanId.NONE);
+    }
+
+    /**
+     * Returns effective locations of given host.
+     *
+     * @param host host to check
+     * @return auxLocations of the host if exists, or locations of the host otherwise.
+     */
+    Set<HostLocation> effectiveLocations(Host host) {
+        return (host.auxLocations() != null) ? host.auxLocations() : host.locations();
     }
 
 }
